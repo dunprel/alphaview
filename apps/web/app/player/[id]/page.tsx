@@ -29,7 +29,7 @@ export default function PlayerPage() {
 
   // State
   const [session,       setSession]       = useState<StreamSession | null>(null);
-  const [content,       setContent]       = useState<Content | null>(null);
+  const [content,       setContent]       = useState<Pick<Content, 'id' | 'title' | 'durationMins' | 'thumbnailUrl'> | null>(null);
   const [error,         setError]         = useState<string | null>(null);
   const [loading,       setLoading]       = useState(true);
   const [playing,       setPlaying]       = useState(false);
