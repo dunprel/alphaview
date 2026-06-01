@@ -1,0 +1,225 @@
+version: '3.9'
+
+# ─── Networks ────────────────────────────────────────────────────────────────
+networks:
+  alphaview:
+    driver: bridge
+
+# ─── Volumes ─────────────────────────────────────────────────────────────────
+volumes:
+  pgdata:
+  mongodata:
+  redisdata:
+  esdata:
+
+# ─── Services ────────────────────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: alphaview_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       alphaview
+      POSTGRES_USER:     alphaview
+      POSTGRES_PASSWORD: alphaview_dev_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - alphaview
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alphaview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MongoDB (Analytics) ─────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7-jammy
+    container_name: alphaview_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: alphaview_analytics
+    volumes:
+      - mongodata:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - alphaview
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (Cache / Queues / Sessions) ───────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: alphaview_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - alphaview
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── RabbitMQ (Job Queues) ───────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: alphaview_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: alphaview
+      RABBITMQ_DEFAULT_PASS: alphaview_dev
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI → http://localhost:15672
+    networks:
+      - alphaview
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── Elasticsearch (Search) ──────────────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.13.0
+    container_name: alphaview_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - alphaview
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  # ── NestJS API ──────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: alphaview_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:       development
+      PORT:           3001
+      DATABASE_URL:   postgresql://alphaview:alphaview_dev_password@postgres:5432/alphaview
+      REDIS_URL:      redis://redis:6379
+      MONGODB_URI:    mongodb://mongo:27017/alphaview_analytics
+      RABBITMQ_URL:   amqp://alphaview:alphaview_dev@rabbitmq:5672
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:      { condition: service_healthy }
+      redis:         { condition: service_healthy }
+      mongo:         { condition: service_healthy }
+      rabbitmq:      { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+    networks:
+      - alphaview
+    volumes:
+      # Mount source for hot reload in dev
+      - ./apps/api/src:/app/src:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ── FFmpeg Transcoding Worker ───────────────────────────────────────────────
+  transcoder:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile.worker
+    container_name: alphaview_transcoder
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:    development
+      RABBITMQ_URL: amqp://alphaview:alphaview_dev@rabbitmq:5672
+      REDIS_URL:    redis://redis:6379
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks:
+      - alphaview
+    volumes:
+      - /tmp/transcoding:/tmp/transcoding
+
+  # ── Next.js Web App ─────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL:              http://localhost:3001/v1
+        NEXT_PUBLIC_PAYSTACK_PUBLIC_KEY:  pk_test_your_key_here
+        NEXT_PUBLIC_APP_URL:              http://localhost:3000
+        NEXT_PUBLIC_CDN_URL:              http://localhost:3001/cdn
+    container_name: alphaview_web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      api: { condition: service_healthy }
+    networks:
+      - alphaview
+    environment:
+      NODE_ENV: production
+
+  # ── Redis Commander (Dev UI) ────────────────────────────────────────────────
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: alphaview_redis_ui
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - alphaview
+    profiles:
+      - tools   # Only starts with: docker compose --profile tools up
+
+  # ── pgAdmin (Dev UI) ────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: alphaview_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@alphaview.tv
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - alphaview
+    profiles:
+      - tools

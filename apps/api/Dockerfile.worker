@@ -1,0 +1,28 @@
+# Transcoding worker — processes video uploads from the Bull queue
+FROM node:20-alpine
+
+# Install FFmpeg
+RUN apk add --no-cache ffmpeg
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci --only=production
+
+COPY . .
+RUN npm run build
+
+# Non-root user
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser  --system --uid  1001 worker
+
+# Temp directory for transcoding
+RUN mkdir -p /tmp/transcoding && chown worker:nodejs /tmp/transcoding
+
+USER worker
+
+ENV NODE_ENV=production \
+    FFMPEG_PATH=/usr/bin/ffmpeg \
+    TEMP_DIR=/tmp/transcoding
+
+CMD ["node", "dist/workers/transcode.worker.js"]
